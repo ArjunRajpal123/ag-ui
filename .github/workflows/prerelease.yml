@@ -5,8 +5,16 @@ name: release / pre
 # with the same suffix to canary a coherent cross-scope set together.
 #
 # SECURITY: Build and publish are split into separate jobs. Publishing
-# secrets (NPM_TOKEN, PYPI_API_TOKEN) are only available in the publish
-# job, never in the same process tree as build-time code execution.
+# secrets (PYPI_API_TOKEN) are only available in the publish job, never
+# in the same process tree as build-time code execution. npm publishing
+# uses OIDC trusted publishing (no token at all) — see below.
+#
+# npm OIDC: The TypeScript publish step does NOT live here. It is delegated
+# to publish-release.yml via `workflow_call` because npm's trusted publisher
+# binding for every @ag-ui/* package is pinned to publish-release.yml's
+# `job_workflow_ref`. If the publish ran inline in this file, npm OIDC would
+# reject it. Do NOT inline an `npm publish` step here with NPM_TOKEN — that
+# would silently sidestep the org-wide OIDC migration.
 
 on:
   workflow_dispatch:
@@ -68,6 +76,7 @@ jobs:
     outputs:
       ts_projects: ${{ steps.ts.outputs.projects }}
       ts_count: ${{ steps.ts.outputs.count }}
+      ts_packages_json: ${{ steps.ts.outputs.packages_json }}
       has_py_packages: ${{ steps.py.outputs.has_packages }}
     steps:
       - name: Checkout repo
@@ -137,8 +146,17 @@ jobs:
           COUNT=$(jq '[.packages[] | select(.ecosystem == "typescript")] | length' /tmp/bump-result.json)
           echo "projects=$PROJECTS" >> "$GITHUB_OUTPUT"
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          # Per-package JSON for publish-release.yml's prerelease_publish loop.
+          # Shape mirrors what the stable publish job consumes:
+          #   [ { "name": "@ag-ui/core", "version": "1.2.3-canary.123", "path": "sdks/typescript/packages/core" }, ... ]
+          # `path` is the workspace-relative dir containing package.json, derived
+          # from the `file` field that prepare-release.ts emits.
+          PACKAGES_JSON=$(jq -c '[.packages[] | select(.ecosystem == "typescript") | {name: .name, version: .newVersion, path: (.file | sub("/package\\.json$"; ""))}]' /tmp/bump-result.json)
+          # Emit as a single-line output so it survives GITHUB_OUTPUT parsing.
+          echo "packages_json=$PACKAGES_JSON" >> "$GITHUB_OUTPUT"
           if [ "$COUNT" -gt 0 ]; then
             echo "TypeScript projects in scope: $PROJECTS"
+            echo "TypeScript packages JSON: $PACKAGES_JSON"
           else
             echo "No TypeScript projects in scope — build/test/publish will be skipped"
           fi
@@ -165,6 +183,15 @@ jobs:
         env:
           STEPS_TS_OUTPUTS_PROJECTS: ${{ steps.ts.outputs.projects }}
 
+      # Upload BOTH dist/ AND the canary-bumped package.json files. The bumps
+      # applied by prepare-release.ts (above) live only on this runner's disk —
+      # they are NOT committed. The downstream prerelease_publish job does a
+      # fresh `actions/checkout` and would otherwise see the ORIGINAL versions,
+      # causing `pnpm pack` to produce a tarball with the wrong version that
+      # no longer matches the TARBALL_NAME computed from ts_packages_json.
+      # Including the bumped package.json files in this artifact lets the
+      # download step in prerelease_publish overlay them into the freshly
+      # checked-out workspace before `pnpm pack` runs.
       - name: Upload TypeScript build artifacts
         if: steps.ts.outputs.count != '0'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -174,6 +201,9 @@ jobs:
             sdks/typescript/packages/*/dist/
             integrations/*/typescript/dist/
             middlewares/*/dist/
+            sdks/typescript/packages/*/package.json
+            integrations/*/typescript/package.json
+            middlewares/*/package.json
           retention-days: 1
 
       - name: Build Python packages
@@ -211,15 +241,45 @@ jobs:
           path: /tmp/bump-result.json
           retention-days: 1
 
-  publish:
+  # TypeScript canary publish runs in publish-release.yml so npm's OIDC
+  # trusted-publisher binding (pinned to publish-release.yml's
+  # job_workflow_ref) accepts the request. NPM_TOKEN is NEVER passed —
+  # OIDC is the only auth path. See the comment block in publish-release.yml
+  # for the full rationale.
+  ts_publish:
     needs: build
-    if: inputs.dry_run != true
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: npm
+    if: needs.build.outputs.ts_count != '0' && inputs.dry_run != true
     permissions:
       contents: read
       id-token: write
+    uses: ./.github/workflows/publish-release.yml
+    with:
+      mode: prerelease
+      ts_projects: ${{ needs.build.outputs.ts_projects }}
+      ts_packages_json: ${{ needs.build.outputs.ts_packages_json }}
+      ts_artifact_name: ts-canary-artifacts
+      dry_run: false
+
+  # Python (PyPI) publish stays inline. PyPI does not use OIDC trusted
+  # publishing for ag-ui — it uses a long-lived API token (PYPI_API_TOKEN),
+  # so there is no `job_workflow_ref` claim to honor, and this job can
+  # safely live in the caller workflow.
+  #
+  # `environment: npm` was intentionally dropped here (the pre-OIDC monolithic
+  # publish job ran under `environment: npm` because it combined ts + py).
+  # PYPI_API_TOKEN is a repo-level secret (verified via the GH API at the
+  # time of this change — neither the `npm` nor `pypi` environment has any
+  # secrets attached; all publishing secrets live at repo scope), so the
+  # token resolves without any environment binding. If a future change moves
+  # PYPI_API_TOKEN into the `pypi` environment, switch this job to
+  # `environment: pypi` to match.
+  py_publish:
+    needs: build
+    if: needs.build.outputs.has_py_packages == 'true' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -232,50 +292,17 @@ jobs:
           name: bump-result
           path: /tmp/
 
-      # --- TypeScript publish ---
-      - name: Setup pnpm
-        if: needs.build.outputs.ts_count != '0'
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4.3.0
-        with:
-          version: "10.33.4"
-
-      - name: Setup Node
-        if: needs.build.outputs.ts_count != '0'
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
-        with:
-          node-version: "22"
-          registry-url: https://registry.npmjs.org
-
-      - name: Download TypeScript build artifacts
-        if: needs.build.outputs.ts_count != '0'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          name: ts-canary-artifacts
-
-      - name: Publish TypeScript packages
-        if: needs.build.outputs.ts_count != '0'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NEEDS_BUILD_OUTPUTS_TS_PROJECTS: ${{ needs.build.outputs.ts_projects }}
-        run: |
-          echo "Publishing TypeScript canary: ${NEEDS_BUILD_OUTPUTS_TS_PROJECTS}"
-          npx nx release publish --projects="${NEEDS_BUILD_OUTPUTS_TS_PROJECTS}" --tag canary
-
-      # --- Python publish ---
       - name: Install uv
-        if: needs.build.outputs.has_py_packages == 'true'
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
         with:
           version: ">=0.8.0"
 
       - name: Download Python build artifacts
-        if: needs.build.outputs.has_py_packages == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: py-canary-artifacts
 
       - name: Publish Python packages
-        if: needs.build.outputs.has_py_packages == 'true'
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
@@ -300,15 +327,75 @@ jobs:
             fi
           fi
 
+  # Always-on summary that consolidates ts_publish + py_publish outcomes.
+  # Uses `always()` so we still summarize when one ecosystem is out of scope
+  # (skipped) or when one publish job failed — but we report success ONLY for
+  # the ecosystems that actually succeeded, and surface failures explicitly
+  # per ecosystem so a partial failure can't masquerade as overall success.
+  publish_summary:
+    needs: [build, ts_publish, py_publish]
+    # Run whenever at least one publish job was attempted (success, failure,
+    # or cancelled — but not when both were skipped). `result` of a skipped
+    # job is 'skipped'; success/failure/cancelled are the cases we summarize.
+    if: |
+      always() &&
+      inputs.dry_run != true &&
+      (needs.ts_publish.result != 'skipped' || needs.py_publish.result != 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download bump result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: bump-result
+          path: /tmp/
+
       - name: Publish summary
+        env:
+          TS_PUBLISH_RESULT: ${{ needs.ts_publish.result }}
+          PY_PUBLISH_RESULT: ${{ needs.py_publish.result }}
         run: |
           {
             echo ""
-            echo "Published canary versions."
+            echo "## Canary publish summary"
             echo ""
-            jq -r '.packages[] | select(.ecosystem == "typescript") | "```\nnpm install \(.name)@canary\n```"' /tmp/bump-result.json
-            jq -r '.packages[] | select(.ecosystem == "python") | "```\npip install \(.name)==\(.newVersion)\n```"' /tmp/bump-result.json
+            # TypeScript ecosystem line — only claim success if the job
+            # actually returned success. Skipped means nothing in scope (fine);
+            # anything else (failure, cancelled) is a real failure to report.
+            if [ "$TS_PUBLISH_RESULT" = "success" ]; then
+              echo "### npm — published"
+              echo ""
+              jq -r '.packages[] | select(.ecosystem == "typescript") | "```\nnpm install \(.name)@canary\n```"' /tmp/bump-result.json
+            elif [ "$TS_PUBLISH_RESULT" = "skipped" ]; then
+              echo "### npm — skipped (no TypeScript packages in scope)"
+            else
+              echo "### npm — FAILED (result: \`${TS_PUBLISH_RESULT}\`)"
+            fi
+            echo ""
+            # Python ecosystem line — same logic.
+            if [ "$PY_PUBLISH_RESULT" = "success" ]; then
+              echo "### PyPI — published"
+              echo ""
+              jq -r '.packages[] | select(.ecosystem == "python") | "```\npip install \(.name)==\(.newVersion)\n```"' /tmp/bump-result.json
+            elif [ "$PY_PUBLISH_RESULT" = "skipped" ]; then
+              echo "### PyPI — skipped (no Python packages in scope)"
+            else
+              echo "### PyPI — FAILED (result: \`${PY_PUBLISH_RESULT}\`)"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail the summary job if any ecosystem that was attempted did not
+          # succeed. This way the overall workflow run reflects partial-failure
+          # state instead of hiding it behind a green summary.
+          if [ "$TS_PUBLISH_RESULT" != "success" ] && [ "$TS_PUBLISH_RESULT" != "skipped" ]; then
+            echo "::error::ts_publish did not succeed (result: ${TS_PUBLISH_RESULT})"
+            exit 1
+          fi
+          if [ "$PY_PUBLISH_RESULT" != "success" ] && [ "$PY_PUBLISH_RESULT" != "skipped" ]; then
+            echo "::error::py_publish did not succeed (result: ${PY_PUBLISH_RESULT})"
+            exit 1
+          fi
 
   dry-run-summary:
     needs: build
