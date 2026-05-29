@@ -256,37 +256,6 @@ def _build_strands_history(input_messages: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def _format_agui_context_text(context: List[Any]) -> str:
-    """Format ``RunAgentInput.context`` entries as a readable text block.
-
-    Each entry is rendered as ``<description>: <value>``.  Entries with
-    neither a description nor a value are skipped.  Returns an empty string
-    when there is nothing to inject so callers can gate on truthiness.
-
-    Intentionally generic — does not filter A2UI-specific entries so that
-    all context is forwarded to the model unchanged.
-    """
-    lines = []
-    for entry in context or []:
-        if isinstance(entry, dict):
-            description = (entry.get("description") or "").strip()
-            value = (entry.get("value") or "").strip()
-        else:
-            description = (getattr(entry, "description", "") or "").strip()
-            value = (getattr(entry, "value", "") or "").strip()
-        if not description and not value:
-            continue
-        if description and value:
-            lines.append(f"{description}: {value}")
-        elif description:
-            lines.append(description)
-        else:
-            lines.append(value)
-    if not lines:
-        return ""
-    return "Context:\n" + "\n".join(lines)
-
-
 class StrandsAgent:
     """AWS Strands Agent wrapper for AG-UI integration."""
 
@@ -696,18 +665,6 @@ class StrandsAgent:
                     # If the builder fails, keep the original message
                     logger.warning(f"State context builder failed: {e}", exc_info=True)
 
-            # Append context entries from RunAgentInput.context to the outgoing
-            # user message so the model can see them.  Applied after
-            # state_context_builder so the hook still operates on the raw
-            # message text.  Skipped for multimodal (list) messages to avoid
-            # breaking content-block structure.
-            context_text = _format_agui_context_text(input_data.context)
-            if context_text and not isinstance(user_message, list):
-                user_message = f"{user_message}\n\n{context_text}"
-                if strands_messages and strands_messages[-1]["role"] == "user":
-                    strands_messages[-1]["content"] = [{"text": user_message}]
-
-
             # Generate unique message ID
             message_id = str(uuid.uuid4())
             message_started = False
@@ -762,20 +719,6 @@ class StrandsAgent:
                                 logger.warning(
                                     f"state_context_builder failed: {e}", exc_info=True
                                 )
-                            break
-                # Append context after state_context_builder for replay path.
-                # Skipped when the last user message is a media block (list content).
-                context_text = _format_agui_context_text(input_data.context)
-                if context_text and native_history:
-                    for native_msg in reversed(native_history):
-                        if (
-                            native_msg.get("role") == "user"
-                            and isinstance(native_msg.get("content"), list)
-                            and native_msg["content"]
-                            and "text" in native_msg["content"][0]
-                        ):
-                            existing = native_msg["content"][0]["text"]
-                            native_msg["content"][0]["text"] = f"{existing}\n\n{context_text}"
                             break
                 strands_agent.messages = native_history
                 # ``stream_async(None)`` tells Strands to use existing
